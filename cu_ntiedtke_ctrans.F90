@@ -2,7 +2,7 @@
  module cu_ntiedtke_ctrans
  use ccpp_kind_types,only: kind_phys
  use cu_ntiedtke_common,only: cmfcmin
-
+ use mpas_log, only : mpas_log_write
 
  implicit none
  private
@@ -59,8 +59,10 @@
  end subroutine cu_ntiedtke_ctrans_finalize
 
 !==================================================================================================================
- subroutine cu_ntiedtke_ctrans_run(klon,klev,nchem,ldcum,lddraf,kctype,kcbot,kctop,kdtop,grav,ztmst,do_scav, &
-                                   fscav,chem,ptenc,ghti,paph,pmfu,pmfd,pmfude_rate,pmfdde_rate,errmsg,errflg)
+ subroutine cu_ntiedtke_ctrans_run(klon, klev, nchem, ldcum, lddraf, kctype, kcbot, kctop, kdtop, &
+                                   grav, ztmst, do_scav, fscav, is_aerosol, scav_data_gas, &
+                                   chem, thv, ptenc, ghti, paph, pmfu, pmfd, pmfude_rate, &
+                                   pmfdde_rate, errmsg, errflg, itimestep, rate_incloud)
 !==================================================================================================================
 
 !--- input arguments:
@@ -68,6 +70,14 @@
 
  integer,intent(in):: klon,klev
  integer,intent(in):: nchem
+
+ integer,intent(in):: itimestep
+
+ real(kind=kind_phys),intent(in),dimension(klon,klev):: thv  ! ADDED: 2D Temperature slice
+ logical,intent(in),dimension(nchem):: is_aerosol
+ real(kind=kind_phys),intent(in),dimension(6,nchem):: scav_data_gas
+ real(kind=kind_phys), intent(inout), dimension(klon, nchem) :: rate_incloud
+
  integer,intent(in),dimension(klon):: kctype,kcbot,kctop,kdtop
 
  logical,intent(in),dimension(klon):: ldcum,lddraf
@@ -156,9 +166,9 @@
 
 
 !--- call to subroutine that computes the convective transport of chemical species:
- call cuctracer(klon,klev,nchem,kctop,kdtop,lldcum,llddraf3,grav,ztmst,do_scav,ghti,paph,zmfuus,zmfdus, &
-                zmfudr,zmfddr,chem,ptenc)
-
+ call cuctracer(klon, klev, nchem, kctop, kdtop, ldcum, lddraf, grav, ztmst, do_scav, &
+                ghti, paph, thv, zmfuus, zmfdus, zmfudr, zmfddr, chem, fscav, &
+                is_aerosol, scav_data_gas, ptenc, itimestep, rate_incloud)
 
 !--- output error flag and message:
  errflg = 0
@@ -168,8 +178,9 @@
  end subroutine cu_ntiedtke_ctrans_run
 
 !==================================================================================================================
- subroutine cuctracer(klon,klev,ktrac,kctop,kdtop,ldcum,lddraf,grav,ztmst,do_scav,ght,paph,pmfu,pmfd, &
-                      pudrate,pddrate,pcen,ptenc)
+ subroutine cuctracer(klon, klev, ktrac, kctop, kdtop, ldcum, lddraf, grav, ztmst, do_scav, &
+                      ght, paph, thv, pmfu, pmfd, pudrate, pddrate, pcen, fscav, &
+                      is_aerosol, scav_data_gas, ptenc, itimestep, rate_incloud)
 !==================================================================================================================
 
 !--- input arguments:
@@ -185,6 +196,16 @@
  real(kind=kind_phys),intent(in),dimension(klon,klev+1):: ght,paph
  real(kind=kind_phys),intent(in),dimension(klon,klev,ktrac):: pcen
 
+ real(kind=kind_phys),intent(in),dimension(klon,klev):: thv ! Local Temperature
+ real(kind=kind_phys),intent(in),dimension(ktrac):: fscav
+ logical,intent(in),dimension(ktrac):: is_aerosol
+ real(kind=kind_phys),intent(in),dimension(6,ktrac):: scav_data_gas
+ real(kind=kind_phys),intent(inout),dimension(klon,ktrac):: rate_incloud ! NEW: [kg/m2/s]
+ real(kind=kind_phys) :: scav_rate
+ real(kind=kind_phys) :: dz
+ integer, intent(in)  :: itimestep
+ real(kind=kind_phys) :: tfac, h_phys, h_star, k1, k2, h_ion, scav_eff
+
 !--- inout arguments:
  real(kind=kind_phys),intent(inout),dimension(klon,klev,ktrac):: ptenc
 
@@ -193,7 +214,7 @@
 
  logical,dimension(klon,klev):: llcumask,llcumbas
 
- real(kind=kind_phys):: zzp,zmfa,zerate,zposi
+ real(kind=kind_phys):: zzp,zmfa,zerate,zposi, chem_before
  real(kind=kind_phys),dimension(klon,klev):: zdp
  real(kind=kind_phys),dimension(klon,klev,ktrac):: zcen,zcu,zcd,zmfc,ztenc
 
@@ -211,6 +232,9 @@
     enddo
  enddo
 
+! Rain pH = 5.0
+ h_ion = 1.0e-5_kind_phys
+ rate_incloud(:,:) = 0.0_kind_phys
 
 !--- loop over all chemical species:
  do jn = 1,ktrac
@@ -281,6 +305,78 @@
 
 
  do jn = 1,ktrac
+
+! --- Convective Scavenging Injection ---
+  if (do_scav) then
+!    call mpas_log_write("Ntiedtke fscav = $r", realArgs=(/fscav(jn)/))
+    do jk = 2, klev
+        do jl = 1, klon
+            if(llcumask(jl,jk)) then
+                dz = abs(ght(jl, jk+1) - ght(jl, jk))  ! layer thickness
+
+                ! Define scavenging efficiency based on your species-specific fscav for aerosols and HLC for gases
+                if (is_aerosol(jn)) then
+                   scav_eff = fscav(jn)
+                else
+                ! THERMODYNAMIC BRANCH: Calculate H_star at local temperature
+                   tfac = (1.0_kind_phys / thv(jl,jk)) - (1.0_kind_phys / 298.15_kind_phys)
+                   h_phys = scav_data_gas(1, jn) * exp(scav_data_gas(2, jn) * tfac)
+                   
+                   if (scav_data_gas(3, jn) > 0.0_kind_phys) then
+                      k1 = scav_data_gas(3, jn) * exp(scav_data_gas(4, jn) * tfac)
+                      if (scav_data_gas(5, jn) > 0.0_kind_phys) then
+                         k2 = scav_data_gas(5, jn) * exp(scav_data_gas(6, jn) * tfac)
+                         
+                         ! NH3 (Base) vs SO2 (Acid)
+                         if (scav_data_gas(1, jn) > 10.0_kind_phys) then
+                            h_star = h_phys * (1.0_kind_phys + (k1 * h_ion) / k2) ! NH3
+                         else
+                            h_star = h_phys * (1.0_kind_phys + k1/h_ion + (k1*k2)/(h_ion**2)) ! SO2
+                         end if
+                      else
+                         h_star = h_phys * (1.0_kind_phys + k1/h_ion) ! MSA
+                      end if
+                   else
+                      h_star = h_phys ! DMS
+                   end if
+
+               ! --- FULL SPECTRUM LOG-LINEAR RAMP ---
+                   ! Interp log10(H*) from -1.0 to 6.0 across 7 orders of magnitude
+                   if (h_star <= 0.1_kind_phys) then
+                      scav_eff = 0.0_kind_phys
+                   else if (h_star >= 1000000.0_kind_phys) then
+                      scav_eff = 1.0_kind_phys
+                   else
+                      scav_eff = (log10(max(1.0e-10_kind_phys, h_star)) + 1.0_kind_phys) / 7.0_kind_phys
+                   end if
+                end if
+
+                ! Since fscav has units of 1/km, we multiply it with dz/1000. dz is in meters.
+                scav_rate = scav_eff * (dz/1000.0_kind_phys)
+                chem_before = zcu(jl,jk,jn) ! Store for diagnostic use
+                
+                ! Apply exponential decay to the updraft concentration (zcu)
+                zcu(jl,jk,jn) = zcu(jl,jk,jn) * exp(-min(scav_rate, 10.0_kind_phys))
+
+                ! Flux [kg/m2/s] = Updraft Air Mass Flux [kg_air/m2/s] * Change in mixing ratio [kg_chem/kg_air]
+                rate_incloud(jl, jn) = rate_incloud(jl, jn) + &
+                                       pmfu(jl, jk) * (chem_before - zcu(jl,jk,jn))
+
+                !if (scav_rate .gt. 0) then
+                !   call mpas_log_write('CONV SCAV [Spec $i, Lev $i]: Rate=$r, Before=$r, After=$r', &
+                !        intArgs=(/jn, jk/), realArgs=(/scav_rate, chem_before, zcu(jl,jk,jn)/))
+            
+                   ! Add Gas-specific thermodynamic info if applicable
+                   !if (.not. is_aerosol(jn)) then
+                   !   call mpas_log_write('   -> GAS THERMO: H_star=$r, Eff=$r km-1', &
+                   !        realArgs=(/h_star, scav_eff/))
+                   !endif
+                !endif
+            endif
+        enddo
+    enddo
+  endif
+
     !compute fluxes:
     do jk = 2,klev
        ik = jk - 1
