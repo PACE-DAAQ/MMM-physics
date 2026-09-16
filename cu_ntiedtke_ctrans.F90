@@ -216,7 +216,7 @@
 
  real(kind=kind_phys):: zzp,zmfa,zerate,zposi, chem_before
  real(kind=kind_phys),dimension(klon,klev):: zdp
- real(kind=kind_phys),dimension(klon,klev,ktrac):: zcen,zcu,zcd,zmfc,ztenc
+ real(kind=kind_phys),dimension(klon,klev,ktrac):: zcen,zcu,zcd,zmfc,ztenc,sink
 
 
 !------------------------------------------------------------------------------------------------------------------
@@ -235,6 +235,9 @@
 ! Rain pH = 5.0
  h_ion = 1.0e-5_kind_phys
  rate_incloud(:,:) = 0.0_kind_phys
+ sink = 0.0_kind_phys
+ zcen = pcen
+ ztenc = 0.0_kind_phys
 
 !--- loop over all chemical species:
  do jn = 1,ktrac
@@ -253,65 +256,18 @@
        zcu(jl,klev,jn) = pcen(jl,klev,jn)
     enddo
 
-    !compute updraft values:
-    do jk = klev-1,3,-1
-       ik = jk + 1
+    ! Ascend from the lowest interface, passing scavenged air to the next level.
+    do jk = klev,2,-1
+       ik = min(jk+1,klev)
        do jl = 1,klon
           if(llcumask(jl,jk)) then
-             zerate = pmfu(jl,jk) - pmfu(jl,ik) + pudrate(jl,jk)
-             zmfa   = 1./max(cmfcmin,pmfu(jl,jk))
-             if(jk >= kctop(jl)) then
+             if(jk < klev .and. jk >= 3 .and. jk >= kctop(jl)) then
+                zerate = pmfu(jl,jk)-pmfu(jl,ik)+pudrate(jl,jk)
+                zmfa = 1./max(cmfcmin,pmfu(jl,jk))
                 zcu(jl,jk,jn) = (pmfu(jl,ik)*zcu(jl,ik,jn) + &
-                zerate*pcen(jl,jk,jn)-pudrate(jl,jk)*zcu(jl,ik,jn))*zmfa
+                     zerate*pcen(jl,jk,jn)-pudrate(jl,jk)*zcu(jl,ik,jn))*zmfa
              endif
-          endif
-       enddo
-    enddo
-
-    !compute downdraft values:
-    do jk = 3,klev
-       ik = jk - 1
-       do jl = 1,klon
-          if(lddraf(jl) .and. jk == kdtop(jl)) then
-             !note: in order to avoid final negative tracer values at LFS
-             !the allowed value of ZCD depends on the jump in mass flux
-             !at the LFS:
-             zcd(jl,jk,jn) = 0.1*zcu(jl,jk,jn) + 0.9*pcen(jl,ik,jn)
-          elseif(lddraf(jl).and.jk>kdtop(jl)) then
-             zerate = -pmfd(jl,jk) + pmfd(jl,ik) + pddrate(jl,jk)
-             zmfa = 1./min(-cmfcmin,pmfd(jl,jk))
-             zcd(jl,jk,jn) = (pmfd(jl,ik)*zcd(jl,ik,jn) - &
-             zerate*pcen(jl,ik,jn)+pddrate(jl,jk)*zcd(jl,ik,jn))*zmfa
-          endif
-       enddo
-    enddo
-
-    !in order to avoid negative tracer at KLEV, then adjust ZCD:
-    jk = klev
-    ik = jk - 1
-    do jl = 1,klon
-       if(lddraf(jl)) then
-          zposi = -zdp(jl,jk) *(pmfu(jl,jk)*zcu(jl,jk,jn) + &
-                  pmfd(jl,jk)*zcd(jl,jk,jn)-(pmfu(jl,jk)+pmfd(jl,jk))*pcen(jl,ik,jn))
-          if(pcen(jl,jk,jn)+zposi*ztmst < 0.) then
-             zmfa = 1./min(-cmfcmin,pmfd(jl,jk))
-             zcd(jl,jk,jn) = ((pmfu(jl,jk)+pmfd(jl,jk))*pcen(jl,ik,jn) - &
-                  pmfu(jl,jk)*zcu(jl,jk,jn)+pcen(jl,jk,jn) / &
-                  (ztmst*zdp(jl,jk)))*zmfa
-          endif
-       endif
-    enddo
- enddo
-
-
- do jn = 1,ktrac
-
-! --- Convective Scavenging Injection ---
-  if (do_scav) then
-!    call mpas_log_write("Ntiedtke fscav = $r", realArgs=(/fscav(jn)/))
-    do jk = 2, klev
-        do jl = 1, klon
-            if(llcumask(jl,jk)) then
+             if(do_scav .and. pmfu(jl,jk)>0.0_kind_phys) then
                 dz = abs(ght(jl, jk+1) - ght(jl, jk))  ! layer thickness
 
                 ! Define scavenging efficiency based on your species-specific fscav for aerosols and HLC for gases
@@ -359,23 +315,51 @@
                 zcu(jl,jk,jn) = zcu(jl,jk,jn) * exp(-min(scav_rate, 10.0_kind_phys))
 
                 ! Flux [kg/m2/s] = Updraft Air Mass Flux [kg_air/m2/s] * Change in mixing ratio [kg_chem/kg_air]
-                rate_incloud(jl, jn) = rate_incloud(jl, jn) + &
-                                       pmfu(jl, jk) * (chem_before - zcu(jl,jk,jn))
+                sink(jl,jk,jn) = max(0.0_kind_phys,pmfu(jl,jk)) * (chem_before-zcu(jl,jk,jn))
+                rate_incloud(jl,jn) = rate_incloud(jl,jn) + sink(jl,jk,jn)
 
-                !if (scav_rate .gt. 0) then
-                !   call mpas_log_write('CONV SCAV [Spec $i, Lev $i]: Rate=$r, Before=$r, After=$r', &
-                !        intArgs=(/jn, jk/), realArgs=(/scav_rate, chem_before, zcu(jl,jk,jn)/))
-            
-                   ! Add Gas-specific thermodynamic info if applicable
-                   !if (.not. is_aerosol(jn)) then
-                   !   call mpas_log_write('   -> GAS THERMO: H_star=$r, Eff=$r km-1', &
-                   !        realArgs=(/h_star, scav_eff/))
-                   !endif
-                !endif
-            endif
-        enddo
+             endif
+          endif
+       enddo
     enddo
-  endif
+
+    !compute downdraft values:
+    do jk = 3,klev
+       ik = jk - 1
+       do jl = 1,klon
+          if(lddraf(jl) .and. jk == kdtop(jl)) then
+             !note: in order to avoid final negative tracer values at LFS
+             !the allowed value of ZCD depends on the jump in mass flux
+             !at the LFS:
+             zcd(jl,jk,jn) = 0.1*zcu(jl,jk,jn) + 0.9*pcen(jl,ik,jn)
+          elseif(lddraf(jl).and.jk>kdtop(jl)) then
+             zerate = -pmfd(jl,jk) + pmfd(jl,ik) + pddrate(jl,jk)
+             zmfa = 1./min(-cmfcmin,pmfd(jl,jk))
+             zcd(jl,jk,jn) = (pmfd(jl,ik)*zcd(jl,ik,jn) - &
+             zerate*pcen(jl,ik,jn)+pddrate(jl,jk)*zcd(jl,ik,jn))*zmfa
+          endif
+       enddo
+    enddo
+
+    !in order to avoid negative tracer at KLEV, then adjust ZCD:
+    jk = klev
+    ik = jk - 1
+    do jl = 1,klon
+       if(lddraf(jl)) then
+          zposi = -zdp(jl,jk) *(pmfu(jl,jk)*zcu(jl,jk,jn) + &
+                  pmfd(jl,jk)*zcd(jl,jk,jn)-(pmfu(jl,jk)+pmfd(jl,jk))*pcen(jl,ik,jn))
+          if(pcen(jl,jk,jn)+zposi*ztmst < 0.) then
+             zmfa = 1./min(-cmfcmin,pmfd(jl,jk))
+             zcd(jl,jk,jn) = ((pmfu(jl,jk)+pmfd(jl,jk))*pcen(jl,ik,jn) - &
+                  pmfu(jl,jk)*zcu(jl,jk,jn)+pcen(jl,jk,jn) / &
+                  (ztmst*zdp(jl,jk)))*zmfa
+          endif
+       endif
+    enddo
+ enddo
+
+
+ do jn = 1,ktrac
 
     !compute fluxes:
     do jk = 2,klev
@@ -410,7 +394,8 @@
     do jk = 2,klev
        do jl = 1,klon
           if(llcumask(jl,jk)) then
-             ptenc(jl,jk,jn) = ptenc(jl,jk,jn)+ztenc(jl,jk,jn)
+             ! Flux divergence alone conserves mass; precipitated mass is a separate sink.
+             ptenc(jl,jk,jn) = ptenc(jl,jk,jn)+ztenc(jl,jk,jn)-zdp(jl,jk)*sink(jl,jk,jn)
           endif
        enddo
     enddo
