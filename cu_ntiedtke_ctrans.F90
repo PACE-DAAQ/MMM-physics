@@ -216,7 +216,7 @@
 
  real(kind=kind_phys):: zzp,zmfa,zerate,zposi, chem_before
  real(kind=kind_phys),dimension(klon,klev):: zdp
- real(kind=kind_phys),dimension(klon,klev,ktrac):: zcen,zcu,zcd,zmfc,ztenc
+ real(kind=kind_phys),dimension(klon,klev,ktrac):: zcen,zcu,zcd,zmfc,ztenc,sink
 
 
 !------------------------------------------------------------------------------------------------------------------
@@ -236,6 +236,7 @@
  h_ion = 1.0e-5_kind_phys
  rate_incloud(:,:) = 0.0_kind_phys
  ! The flux loop reads zcen(:,1,:); initialize every level.
+ sink = 0.0_kind_phys
  zcen = pcen
  ztenc = 0.0_kind_phys
 
@@ -362,8 +363,8 @@
                 zcu(jl,jk,jn) = zcu(jl,jk,jn) * exp(-min(scav_rate, 10.0_kind_phys))
 
                 ! Flux [kg/m2/s] = Updraft Air Mass Flux [kg_air/m2/s] * Change in mixing ratio [kg_chem/kg_air]
-                rate_incloud(jl, jn) = rate_incloud(jl, jn) + &
-                                       pmfu(jl, jk) * (chem_before - zcu(jl,jk,jn))
+                sink(jl,jk,jn) = pmfu(jl,jk) * (chem_before-zcu(jl,jk,jn))
+                rate_incloud(jl,jn) = rate_incloud(jl,jn) + sink(jl,jk,jn)
 
                 !if (scav_rate .gt. 0) then
                 !   call mpas_log_write('CONV SCAV [Spec $i, Lev $i]: Rate=$r, Before=$r, After=$r', &
@@ -413,7 +414,7 @@
     do jk = 2,klev
        do jl = 1,klon
           if(llcumask(jl,jk)) then
-             ptenc(jl,jk,jn) = ptenc(jl,jk,jn)+ztenc(jl,jk,jn)
+             ptenc(jl,jk,jn) = ptenc(jl,jk,jn)+ztenc(jl,jk,jn)-zdp(jl,jk)*sink(jl,jk,jn)
           endif
        enddo
     enddo
