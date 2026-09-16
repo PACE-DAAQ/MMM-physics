@@ -235,6 +235,9 @@
 ! Rain pH = 5.0
  h_ion = 1.0e-5_kind_phys
  rate_incloud(:,:) = 0.0_kind_phys
+ ! The flux loop reads zcen(:,1,:); initialize every level.
+ zcen = pcen
+ ztenc = 0.0_kind_phys
 
 !--- loop over all chemical species:
  do jn = 1,ktrac
