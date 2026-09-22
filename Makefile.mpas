@@ -1,3 +1,6 @@
+# Clear the built-in suffix list first: it holds .mod ahead of any appended
+# .F90, so an existing Fortran .mod would otherwise satisfy x.o via m2c.
+.SUFFIXES:
 .SUFFIXES: .F90 .o
 
 .PHONY: physics_mmm physics_mmm_lib
